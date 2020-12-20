@@ -1,0 +1,225 @@
+---
+title: "OLW_18S_2"
+author: "Cecilia"
+date: "19/12/2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# the complete dada2 pipeline for amplicon analyses with ASVs output
+
+```{r load libraries}
+
+library(dada2); packageVersion("dada2")
+#[1] ‘1.12.1’
+library(phyloseq); packageVersion("phyloseq")
+## [1] '1.28.0'
+library(Biostrings); packageVersion("Biostrings")
+## [1] '2.52.0'
+library(ggplot2); packageVersion("ggplot2")
+## [1] ‘3.2.1’
+library(dplyr); packageVersion("dplyr")
+## [1] ‘0.8.3’
+library(scales); packageVersion("scales")
+## [1] ‘1.0.0’
+
+```
+
+
+```{r load datasets}
+# change the path directory to local directory
+path<-"file1_18S"
+list.files(path)
+path2<-"file2_18S"
+list.files(path2)
+
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_L001_R1_001.fastq and SAMPLENAME_L002_R2_001.fastq
+fnFs1 <- sort(list.files(path, pattern="_L001_R1_001.fastq.gz", full.names = TRUE))
+fnRs1 <- sort(list.files(path, pattern="_L001_R2_001.fastq.gz", full.names = TRUE))
+fnFs2 <- sort(list.files(path2, pattern="_L001_R1_001.fastq.gz", full.names = TRUE))
+fnRs2 <- sort(list.files(path2, pattern="_L001_R2_001.fastq.gz", full.names = TRUE))
+fnFs<-c(fnFs1,fnFs2)
+fnRs<-c(fnRs1,fnRs2)
+
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names1 <- paste0(sapply(strsplit(basename(fnFs1), "_"), `[`, 1),"_",sapply(strsplit(basename(fnFs1), "_"), `[`, 2))
+sample.names2 <- paste0(sapply(strsplit(basename(fnFs2), "_"), `[`, 1),"_",sapply(strsplit(basename(fnFs2), "_"), `[`, 2))
+sample.names<-c(sample.names1,sample.names2)
+```
+
+
+```{r quality visual, eval=FALSE, include=FALSE}
+# Visualisation of read qualities
+# for reverse reads, a dramatic drop on quality @ about cycle 20, not sure what caused that. 
+plotQualityProfile(fnFs1[1:6])
+plotQualityProfile(fnRs1[1:6])
+plotQualityProfile(fnFs2[1:6])
+plotQualityProfile(fnRs2[1:6])
+
+
+
+
+```
+
+```{r datasets QC and filterations}
+# Place filtered files in filtered/ subdirectory
+# filtered 16S results from MGS00236_1 and MGS00236_4 will be put to the same folder for further analyses 
+filtFs1 <- file.path(path, "filtered", paste0(sample.names1, "_F_filt.fastq.gz"))
+filtRs1 <- file.path(path, "filtered", paste0(sample.names1, "_R_filt.fastq.gz"))
+filtFs2 <- file.path(path, "filtered", paste0(sample.names2, "_F_filt.fastq.gz"))
+filtRs2 <- file.path(path, "filtered", paste0(sample.names2, "_R_filt.fastq.gz"))
+
+# file name combine
+filtFs<-c(filtFs1,filtFs2)
+filtRs<-c(filtRs1,filtRs2)
+names(filtFs) <- sample.names
+
+
+
+# filter and trim the reads with a maximum number of 2 errors 
+out1 <- filterAndTrim(fnFs1, filtFs1, fnRs1, filtRs1,
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+out1
+
+out2 <- filterAndTrim(fnFs2, filtFs2, fnRs2, filtRs2,
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+# list out number of reads before and after filter+trim
+out2
+out<-rbind(out1,out2)
+
+# estimate error rate for the filtered datasets
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+# 
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+
+```
+
+
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+dadaFs[[1]]
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+# construct an amplicon sequence variant table (ASV) table
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+##Remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+# Change on number of reads through pipeline
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+taxa <- assignTaxonomy(seqtab.nochim, "database/silva_nr_v132_train_set.fa.gz", multithread=TRUE)
+taxa.print <- taxa 
+rownames(taxa.print) <- NULL # Removing sequence rownames for display only
+head(taxa.print)
+
+
+
+
+```
+
+```{r import metadata and build phyloseq}
+
+# modify sample names to match with the metadata
+meta<-read.csv("metadata.csv")
+meta$SampleName<-as.character(meta$SampleName)
+meta$Alternative.name<-as.character(meta$Alternative.name)
+meta$Alternative.name<-ifelse(meta$Alternative.name=="", meta$SampleName,meta$Alternative.name)
+meta<-subset(meta, !is.na(meta$SampleID))
+Plate1_sample99<-c(99, "F17_480", "F17_480", "Faecal",	"RG 150N", "515rcbc35",	"GAGATACAGTTC")
+meta<-rbind(meta, Plate1_sample99)
+
+
+# build the metadata for phyloseq
+samples.out <- rownames(seqtab.nochim)
+Sample_ID <- as.numeric(sapply(strsplit(basename(samples.out), "_"), `[`, 1))
+samdf<- data.frame(meta[match(Sample_ID,meta$SampleID),],Sample_uni=samples.out, stringsAsFactors = FALSE)
+samdf[samdf$Sample_uni=="99_S23",]<-c("99", "F17_480", "F17_480", "Faecal",	"RG 150N", "515rcbc35",	"GAGATACAGTTC","99_S23")
+samdf[] <- lapply(samdf, as.character)
+samdf<-subset(samdf, !is.na(samdf$SampleID))
+rownames(samdf)<-samdf$Sample_uni
+write.csv(samdf, "18S_meta_complete.csv",row.names = FALSE)
+
+ps_18S <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa))
+dna <- Biostrings::DNAStringSet(taxa_names(ps_18S))
+names(dna) <- taxa_names(ps_18S)
+ps_18S <- merge_phyloseq(ps_18S, dna)
+taxa_names(ps_18S) <- paste0("ASV", seq(ntaxa(ps_18S)))
+ps_18S
+
+```
+
+
+```{r taxonomy visual, eval=FALSE, include=FALSE}
+rank_names(ps_18S)
+## [1] "Kingdom" "Phylum"  "Class"   "Order"   "Family"  "Genus" 
+OLW_18S_Phylum_sum<-ps_18S %>% 
+  tax_glom(taxrank = "Phylum") %>% 
+  transform_sample_counts(function(x) {x/sum(x)}) %>%
+  psmelt() %>% 
+  filter(Abundance>0.01) %>% 
+  arrange(Phylum)
+Order_18Sp<-ggplot(OLW_18S_Phylum_sum, aes(SampleType, Abundance, fill=Phylum))+geom_bar(stat = "identity", position = "fill") +scale_y_continuous(labels = percent_format()) +ylab("Relative Abundance")+facet_wrap(~TreatmentType)
+Order_18Sp
+```
+
+
+
+```{r list all packages used for this script and the version}
+sessionInfo()
+
+```
+R version 3.6.1 (2019-07-05)
+Platform: x86_64-apple-darwin15.6.0 (64-bit)
+Running under: macOS High Sierra 10.13.6
+
+Matrix products: default
+BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib
+LAPACK: /Library/Frameworks/R.framework/Versions/3.6/Resources/lib/libRlapack.dylib
+
+locale:
+[1] en_NZ.UTF-8/en_NZ.UTF-8/en_NZ.UTF-8/C/en_NZ.UTF-8/en_NZ.UTF-8
+
+attached base packages:
+[1] stats4    parallel  stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] scales_1.0.0        dplyr_0.8.3         ggplot2_3.2.1       Biostrings_2.52.0   XVector_0.24.0      IRanges_2.18.3      S4Vectors_0.22.1    BiocGenerics_0.30.0 phyloseq_1.28.0    
+[10] dada2_1.12.1        Rcpp_1.0.2         
+
+loaded via a namespace (and not attached):
+ [1] Biobase_2.44.0              jsonlite_1.6                splines_3.6.1               foreach_1.4.7               StanHeaders_2.19.0          RcppParallel_4.4.4         
+ [7] assertthat_0.2.1            latticeExtra_0.6-28         GenomeInfoDbData_1.2.1      Rsamtools_2.0.2             pillar_1.4.2                lattice_0.20-38            
+[13] glue_1.3.1                  digest_0.6.21               GenomicRanges_1.36.1        RColorBrewer_1.1-2          colorspace_1.4-1            Matrix_1.2-17              
+[19] plyr_1.8.4                  pkgconfig_2.0.3             rstan_2.19.2                ShortRead_1.42.0            zlibbioc_1.30.0             purrr_0.3.2                
+[25] processx_3.4.1              BiocParallel_1.18.1         tibble_2.1.3                mgcv_1.8-29                 withr_2.1.2                 SummarizedExperiment_1.14.1
+[31] lazyeval_0.2.2              cli_1.1.0                   survival_2.44-1.1           magrittr_1.5                crayon_1.3.4                ps_1.3.0                   
+[37] nlme_3.1-141                MASS_7.3-51.4               hwriter_1.3.2               pkgbuild_1.0.5              vegan_2.5-6                 loo_2.1.0                  
+[43] prettyunits_1.0.2           tools_3.6.1                 data.table_1.12.2           matrixStats_0.55.0          stringr_1.4.0               Rhdf5lib_1.6.1             
+[49] munsell_0.5.0               cluster_2.1.0               DelayedArray_0.10.0         callr_3.3.2                 ade4_1.7-13                 compiler_3.6.1             
+[55] GenomeInfoDb_1.20.0         rlang_0.4.0                 rhdf5_2.28.0                grid_3.6.1                  RCurl_1.95-4.12             iterators_1.0.12           
+[61] biomformat_1.12.0           rstudioapi_0.10             igraph_1.2.4.1              bitops_1.0-6                labeling_0.3                gtable_0.3.0               
+[67] codetools_0.2-16            multtest_2.40.0             inline_0.3.15               reshape2_1.4.3              R6_2.4.0                    gridExtra_2.3              
+[73] GenomicAlignments_1.20.1    knitr_1.25                  permute_0.9-5               ape_5.3                     stringi_1.4.3               tidyselect_0.2.5           
+[79] xfun_0.10                  

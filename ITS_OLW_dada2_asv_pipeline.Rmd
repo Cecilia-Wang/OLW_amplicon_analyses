@@ -1,0 +1,205 @@
+---
+title: "Cleaned_ITS"
+author: "ITS_OLW_dada2_asv_pipeline"
+date: "08/01/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+
+library(dada2); packageVersion("dada2")
+#[1] ‘1.12.1’
+library(phyloseq); packageVersion("phyloseq")
+## [1] '1.28.0'
+library(Biostrings); packageVersion("Biostrings")
+## [1] '2.52.0'
+library(ggplot2); packageVersion("ggplot2")
+## [1] ‘3.2.1’
+library(dplyr); packageVersion("dplyr")
+## [1] ‘0.8.3’
+library(scales); packageVersion("scales")
+## [1] ‘1.0.0’
+library(ShortRead); packageVersion("ShortRead")
+# [1] ‘1.42.0’
+
+```
+
+```{r}
+# change the path directory to local directory
+path<-"file1_ITS"
+list.files(path)
+path2<-"file2_ITS"
+list.files(path2)
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_L001_R1_001.fastq and SAMPLENAME_L002_R2_001.fastq
+fnFs1 <- sort(list.files(path, pattern="_L001_R1_001.fastq.gz", full.names = TRUE))
+fnRs1 <- sort(list.files(path, pattern="_L001_R2_001.fastq.gz", full.names = TRUE))
+fnFs2 <- sort(list.files(path2, pattern="_L001_R1_001.fastq.gz", full.names = TRUE))
+fnRs2 <- sort(list.files(path2, pattern="_L001_R2_001.fastq.gz", full.names = TRUE))
+fnFs<-c(fnFs1,fnFs2)
+fnRs<-c(fnRs1,fnRs2)
+
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names1 <- paste0(sapply(strsplit(basename(fnFs1), "_"), `[`, 1),"_",sapply(strsplit(basename(fnFs1), "_"), `[`, 2))
+sample.names2 <- paste0(sapply(strsplit(basename(fnFs2), "_"), `[`, 1),"_",sapply(strsplit(basename(fnFs2), "_"), `[`, 2))
+sample.names<-c(sample.names1,sample.names2)
+
+# Identify primers
+FWD <- "GTGARTCATCGAATCTTTG"
+REV <- "TCCTCCGCTTATTGATATGC" 
+
+# In theory if you understand your amplicon sequencing setup, this is sufficient to continue. However, to ensure we have the right primers, and the correct orientation of the primers on the reads, we will verify the presence and orientation of these primers in the data.
+allOrients <- function(primer) {
+    # Create all orientations of the input sequence
+    require(Biostrings)
+    dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors
+    orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+        RevComp = reverseComplement(dna))
+    return(sapply(orients, toString))  # Convert back to character vector
+}
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+FWD.orients
+
+# The presence of ambiguous bases (Ns) in the sequencing reads makes accurate mapping of short primer sequences difficult. Next we are going to “pre-filter” the sequences just to remove those with Ns, but perform no other filtering
+fnFs1.filtN <- file.path(path, "filtN", basename(fnFs1)) # Put N-filterd files in filtN/ subdirectory
+fnRs1.filtN <- file.path(path, "filtN", basename(fnRs1))
+fnFs2.filtN <- file.path(path, "filtN", basename(fnFs2)) # Put N-filterd files in filtN/ subdirectory
+fnRs2.filtN <- file.path(path, "filtN", basename(fnRs2))
+fnFs.filtN <- c(fnFs1.filtN, fnFs2.filtN)
+fnRs.filtN <- c(fnRs1.filtN, fnRs2.filtN)
+
+filterAndTrim(fnFs, fnFs.filtN, fnRs, fnRs.filtN, maxN = 0, multithread = TRUE)
+
+# Count the number of times the primers appear in the forward and reverse read, while considering all possible primer orientations. 
+primerHits <- function(primer, fn) {
+    # Counts number of reads in which the primer is found
+    nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+    return(sum(nhits > 0))
+}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.filtN[[1]]), 
+    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.filtN[[1]]), 
+    REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.filtN[[1]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.filtN[[1]]))
+#                  Forward Complement Reverse RevComp
+# FWD.ForwardReads       0          0       0       0
+# FWD.ReverseReads       0          0       0       0
+# REV.ForwardReads       0          0       0       0
+# REV.ReverseReads       0          0       0       0
+
+# This indicate primers are already removed
+# skipped the primer removal step
+
+
+```
+
+
+```{r}
+# Inspect read quality
+plotQualityProfile(fnFs[1:2])
+plotQualityProfile(fnRs[1:2])
+
+# Assigning the filenames for the output of the filtered reads to be stored as fastq.gz files.
+
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+
+out <- filterAndTrim(fnFs.filtN, filtFs, fnRs.filtN, filtRs, maxN = 0, maxEE = c(2, 2), 
+    truncQ = 2, minLen = 50, rm.phix = TRUE, compress = TRUE, multithread = TRUE)  # on windows, set multithread = FALSE
+
+head(out)
+#                             reads.in reads.out
+# 1_S1_L001_R1_001.fastq.gz     163326    144952
+# 10_S13_L001_R1_001.fastq.gz    51930     46765
+# 11_S25_L001_R1_001.fastq.gz    65247     58010
+# 12_S38_L001_R1_001.fastq.gz    89340     77950
+# 13_S50_L001_R1_001.fastq.gz    54856     46444
+# 14_S62_L001_R1_001.fastq.gz    42910     38858
+
+# calculate the error rate
+errF <- learnErrors(filtFs, multithread=TRUE)
+# 109794932 total bases in 728577 reads from 13 samples will be used for learning the error rates.
+errR <- learnErrors(filtRs, multithread=TRUE)
+# 109774182 total bases in 728577 reads from 13 samples will be used for learning the error rates.
+# plot
+plotErrors(errF, nominalQ=TRUE)
+```
+
+
+```{r}
+# Sample inference
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+
+
+# Merge paired reads
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+head(mergers[[1]])
+
+# amplicon sequence variant table (ASV) table dimensions
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+
+sum(seqtab.nochim)/sum(seqtab)
+
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+
+# For fungal taxonomy, the General Fasta release files from the Unite ITS database is used here.
+# UNITE Community (2019): UNITE general FASTA release for Fungi. Version 18.11.2018. UNITE Community. https://doi.org/10.15156/BIO/786343
+unite.ref <- "database/sh_general_release_dynamic_02.02.2019.fasta"
+taxa <- assignTaxonomy(seqtab.nochim, unite.ref, multithread = TRUE, tryRC = TRUE)
+
+taxa.print <- taxa  # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+```
+
+```{r import metadata and build phyloseq}
+
+# modify sample names to match with the metadata
+meta<-read.csv("metadata.csv")
+meta$SampleName<-as.character(meta$SampleName)
+meta$Alternative.name<-as.character(meta$Alternative.name)
+meta$Alternative.name<-ifelse(meta$Alternative.name=="", meta$SampleName,meta$Alternative.name)
+meta<-subset(meta, !is.na(meta$SampleID))
+Plate1_sample99<-c(99, "F17_480", "F17_480", "Faecal",	"RG 150N", "515rcbc35",	"GAGATACAGTTC")
+meta<-rbind(meta, Plate1_sample99)
+
+
+# build the metadata for phyloseq
+
+rownames(seqtab.nochim)<-gsub("_F_filt.fastq.gz", "", rownames(seqtab.nochim))
+samples.out <- rownames(seqtab.nochim)
+Sample_ID <- as.numeric(sapply(strsplit(basename(samples.out), "_"), `[`, 1))
+samdf<- data.frame(meta[match(Sample_ID,meta$SampleID),],Sample_uni=samples.out, stringsAsFactors = FALSE)
+samdf[samdf$Sample_uni=="99_S23",]<-c("99", "F17_480", "F17_480", "Faecal",	"RG 150N", "515rcbc35",	"GAGATACAGTTC","99_S23")
+samdf[] <- lapply(samdf, as.character)
+samdf<-subset(samdf, !is.na(samdf$SampleID))
+rownames(samdf)<-samdf$Sample_uni
+ps_ITS <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa))
+dna <- Biostrings::DNAStringSet(taxa_names(ps_ITS))
+names(dna) <- taxa_names(ps_ITS)
+ps_ITS <- merge_phyloseq(ps_ITS, dna)
+taxa_names(ps_ITS) <- paste0("ASV", seq(ntaxa(ps_ITS)))
+ps_ITS
+
+```
