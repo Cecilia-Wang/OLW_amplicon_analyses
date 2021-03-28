@@ -1,0 +1,865 @@
+---
+title: "OLW_16S_ASV_data_analyses"
+author: "Cecilia"
+date: "20/09/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r global options, include = FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+knitr::opts_chunk$set(fig.width=12, fig.height=8) 
+```
+## ASV results
+
+```{r load libraries and show their versions}
+
+library(phyloseq); packageVersion("phyloseq")
+## [1] '1.28.0'
+library(Biostrings); packageVersion("Biostrings")
+## [1] '2.52.0'
+library(ggplot2); packageVersion("ggplot2")
+## [1] ‘3.2.1’
+library(plyr); packageVersion("plyr")
+## [1] ‘1.8.4’
+library(dplyr); packageVersion("dplyr")
+## [1] ‘0.8.3’
+library(scales); packageVersion("scales")
+## [1] ‘1.0.0’
+library(vegan); packageVersion("vegan")
+## [1] ‘2.5.6’
+library(edgeR);packageVersion("edgeR")
+## [1] ‘3.26.8’
+library(RColorBrewer);packageVersion("RColorBrewer")
+## [1] ‘1.1.2’
+library(ggpubr);packageVersion("ggpubr")
+## [1] ‘0.2.3’
+library(forcats); packageVersion("forcats")
+## [1] ‘0.4.0’
+library(lemon);packageVersion("lemon")
+# [1] ‘0.4.3’
+theme_set(theme_bw()) # set theme to all plots produced
+```
+
+
+```{r customized functions, include=FALSE}
+# function to split a parent phyloseq to subsets of phyloseqs based on a variable
+phyloseq_sep_variable <- function(physeq, variable, drop_zeroes = T){
+    
+    # require(phyloseq)
+    # require(plyr)
+
+    ## Check the input
+    if(is.null(phyloseq::sample_data(physeq, errorIfNULL = F))){
+        stop("Sample data is missing in the phyloseq-object.\n")
+    }
+
+    ## Extract sample meta-data
+    mtd <- as(object = phyloseq::sample_data(physeq), Class = "data.frame")
+
+    if(!variable %in% colnames(mtd)){
+        stop("Grouping variable is missing from the sample data of phyloseq-object.\n")
+    }
+
+    if(class(mtd[, variable]) %in% c("integer", "numeric") ){
+        if( length( unique(mtd[, variable]) ) > 5){
+          stop("Groupping variable is numeric and it has too many levels. Consider transforming it to factor.\n")
+        } else {
+          warning("Groupping variable is numeric and it was coerced to factor.\n")
+          mtd[, variable] <- factor(mtd[, variable])
+        }
+    }
+
+    if(length(table(mtd[, variable])) == 1){
+        cat("Warning: there is only one group of samples in the resulting list.\n")
+    }
+
+    ## Add sample IDs to the meta-data
+    smp <- data.frame(
+        SID = phyloseq::sample_names(physeq),
+        mtd,
+        stringsAsFactors = F)
+
+    ## Extract sample names by the specified variable
+    svv <- plyr::dlply(.data = smp, .variables = variable, .fun = function(z){ z$SID })
+
+    ## Extract samples by groupping variable
+    res <- plyr::llply(.data = svv, .fun = function(z){ phyloseq::prune_samples(z, x = physeq) })
+
+    ## Remove taxa with zero abundance
+    if(drop_zeroes == TRUE){
+        res <- plyr::llply(.data = res, .fun = function(x){ phyloseq::prune_taxa(phyloseq::taxa_sums(x) > 0, x) })
+    }
+
+    return(res)
+}
+
+# perform exact test by groups using phyloseq objects
+phyloseq_to_edgeR <- function(physeq, group, method="RLE", ...){
+  require("edgeR")
+  require("phyloseq")
+  # Enforce orientation.
+  if( !taxa_are_rows(physeq) ){ physeq <- t(physeq) }
+  x = as(otu_table(physeq), "matrix")
+  # Add one to protect against overflow, log(0) issues.
+  x = x + 1
+  # Check `group` argument
+  if( identical(all.equal(length(group), 1), TRUE) & nsamples(physeq) > 1 ){
+    # Assume that group was a sample variable name (must be categorical)
+    group = get_variable(physeq, group)
+  }
+  # Define gene annotations (`genes`) as tax_table
+  taxonomy = tax_table(physeq, errorIfNULL=FALSE)
+  if( !is.null(taxonomy) ){
+    taxonomy = data.frame(as(taxonomy, "matrix"))
+  } 
+  # Now turn into a DGEList
+  y = DGEList(counts=x, group=group, genes=taxonomy, remove.zeros = TRUE, ...)
+  # Calculate the normalization factors
+  z = calcNormFactors(y, method=method)
+  # Check for division by zero inside `calcNormFactors`
+  if( !all(is.finite(z$samples$norm.factors)) ){
+    stop("Something wrong with edgeR::calcNormFactors on this data,
+         non-finite $norm.factors, consider changing `method` argument")
+  }
+  # Estimate dispersions
+  return(estimateTagwiseDisp(estimateCommonDisp(z)))
+}
+
+compare_beta_diversity <- function(phylo,
+                                   x = as.character(),
+                                   group = as.character(),
+                                   test = c("adonis", "anosim"),
+                                   bdiv = c("weighted", "unweighted"),
+                                   write = F,
+                                   filename = "results",
+                                   fdr = T,
+                                   fdr_test = "fdr",
+                                   seed = 918, ...){
+
+  # Get samples metadata into dataframe
+  metadata <- as(phyloseq::sample_data(phylo), "data.frame")
+
+  # VADLIDATION (TODO)
+
+  # Assign variable to weighted/unweighted choice
+  if(bdiv == "unweighted"){
+    weighted = FALSE
+  } else if(bdiv == "weighted"){
+    weighted = TRUE
+  } else{
+    stop("Error processing beta diversity choice. Please be sure your input is correct.")
+  }
+
+  # Split table according to timepoint variable
+  sptables <- split(metadata, metadata[[x]], drop = T)
+
+  # Iterate over each time point and apply significance function
+  final <- do.call(rbind, lapply(sptables, function(data) {
+
+    # Drop unused levels from metadata
+    data[[group]] <- droplevels(data[[group]])
+
+    # Get levels for comparisons
+    comparing_groups <- levels(data[[group]])
+
+    # Check number of levels
+    if(length(comparing_groups) <= 1){
+      message("Not enough factors, skipping this timepoint", appendLF = T)
+      return(NULL)
+    }
+
+    # Find each 2 group comparison
+    comparison_list <- combn(comparing_groups, 2, simplify = F)
+
+    # Iterate over 2 group comparisons for one time point
+    do.call(rbind, lapply(comparison_list, function(combination){
+
+      # Subset metadata and apply to phyloseq object
+      metatable_sub <- subset(data, data[[group]] %in% combination, droplevels = T)
+      phylo0 = phylo
+      phyloseq::sample_data(phylo0) <- metatable_sub
+
+      # Run Unifrac
+      set.seed(seed)
+      unifrac <- phyloseq::UniFrac(phylo0, weighted = weighted)
+
+      # Print message
+      message(paste("Comparing:",
+                    combination[1], "vs", combination[2] ,
+                    "at",
+                    as.character(x), unique(metatable_sub[[x]]), sep = " "),
+              appendLF = T)
+
+      # Caculate tests
+      if(test == "adonis"){
+        return(adonis_test(dm = unifrac,
+                           meta = metatable_sub,
+                           group = group,
+                           x = x,
+                           time = unique(metatable_sub[[x]]), 
+                           combination1 = as.character(combination[1]),
+                           combination2 = as.character(combination[2])))
+      }
+      if(test == "anosim"){
+        return(anosim_test(dm = unifrac,
+                           meta = metatable_sub,
+                           group = group,
+                           x = x,
+                           time = unique(metatable_sub[[x]]), 
+                           combination1 = as.character(combination[1]),
+                           combination2 = as.character(combination[2])))
+      }
+
+    })) # end of 2-group comparison iteration
+
+  })) # end of time iteration
+
+  message("Iterations completed...")
+
+  # Correction for multiple comparisons
+  if(fdr == TRUE){
+    message("Appying multiple-testing corrections...")
+    final$padj <- p.adjust(final$pvalue, method = fdr_test)
+  }
+
+  # Write results to file
+  write.table(final, paste0(filename, '.txt'), quote = F, sep = '\t', row.names = F)
+  return(final)
+
+} # End of main function
+
+# Function for calculating adonis p-values
+adonis_test <- function(dm, meta, group, x, time, combination1, combination2){
+  
+  # Try comparisons
+  results <- suppressWarnings(try(vegan::adonis(formula = as.dist(dm) ~ meta[[group]], permutations = 999)))
+  #results2 <- suppressWarnings(try(vegan::permutest(betadisper(as.dist(dm), metadata[["number"]]))))
+
+  # If error write NA's to results
+  if(class(results) == "try-error"){
+    pval <- 'NA'
+    SumsOfSqs <- "NA"
+    MeanSqs <- "NA"
+    F.Model <- "NA"
+    R2 <- "NA"
+  }
+
+  # If no error, assign results to variables
+  if(class(results) == "adonis") {
+    pval <- results$aov.tab$`Pr(>F)`[1]
+    SumsOfSqs <- results$aov.tab$SumsOfSqs[1]
+    MeanSqs <- results$aov.tab$MeanSqs[1]
+    F.Model <- results$aov.tab$F.Model[1]
+    R2 <- results$aov.tab$R2[1]
+  }
+
+  # Place results into dataframe
+  results_mat <- data.frame(Group1 = as.character(combination1),
+                            Group2 = as.character(combination2),
+                            x = time,
+                            n = nrow(meta),
+                            SumsOfSqs = SumsOfSqs,
+                            MeanSqs = MeanSqs,
+                            F.Model = F.Model,
+                            R2 = R2,
+                            pvalue = pval)
+  return(results_mat)
+}
+
+# Function for calculating anosim p-values
+anosim_test <- function(dm, meta, group, x, time, combination1, combination2){
+
+  # Try comparisons
+  results <- suppressWarnings(try(vegan::anosim(as.dist(dm), meta[[group]], permutations = 999)))
+
+  # If too little amount of samples are present for either group, result in None.
+  if(class(results) == "try-error"){
+    pval <- 'NA'
+    R_value <- "NA"
+  }
+
+  # If no error, assign results to variables
+  if(class(results) == "anosim"){
+    pval <- results$signif
+    R_value <- results$statistic
+  }
+
+  # Place results into dataframe
+  results_mat <- data.frame(Group1 = combination1,
+                            Group2 = combination2,
+                            x = time,
+                            n = nrow(meta),
+                            R_value = R_value,
+                            pvalue = pval)
+
+  return(results_mat)
+}
+```
+
+
+```{r set the working directory and color matching set ups}
+# change the PATH in quotes in the next line to locate the files
+PATH<-"path/to/the/sequence/files" 
+setwd(PATH)
+
+# set theme to all plots
+theme_set(theme_bw()) 
+
+# set colors for phyla so all the figures will be consistent in colors 
+colourList <- c("Acidobacteria"="#E41A1C", "Actinobacteria"="#AA3B50", "Bacteria_unclassified"="#705C83", "Bacteroidetes"="#377EB8", "candidate_division_WPS-1"="#3E8E93", "Cyanobacteria/Chloroplast"="light blue", "Euryarchaeota"="light green", "Fibrobacteres"="#BA5E6C", "Firmicutes"="#7E6E85", "Gemmatimonadetes"="#984EA3", "Lentisphaerae"="#658E67", "Planctomycetes"="#459E6E", "Proteobacteria"="#FF7F00", "Spirochaetes"="#FFA910", "SR1"="#FFD421",  "Verrucomicrobia"="#FFFF33", "Chloroflexi"="#E1C62F", "Cyanobacteria"="light blue", "Elusimicrobia"="#C38E2B", "Epsilonbacteraeota"="#A65628", "Kiritimatiellaeota"="#C1645A", "Omnitrophicaeota"="#DB728C", "Patescibacteria"="#F781BF", "Synergistetes"="#D789B2", "Tenericutes"="#B891A5", "Thaumarchaeota"="#999999","NA"="#000000")
+
+# set colors for niches so all the figures will be consistent in colors 
+colourList1 <- c("BulkSoil"="#A65628", "Rumen"="#1F78B4", "WhiteCloverRoot"="#FDBF6F", "P.RyeGrassRoot"="#FB9A99", "P.RyeGrassLeaf"="#33A02C", "Faecal"="#E31A1C", "WhiteCloverLeaf"="#B2DF8A", "NA"="#000000", "Effluent"="#808080")
+```
+
+
+
+```{r load the phyloseq object and rarefication}
+# load the phyloseq object from Dada2 pipelines
+ps_16S<-readRDS(file = "OLW_16Sdata_asv.rds") 
+ps_16S 
+# remove irelevant samples and booking errors 
+ps_16S_s<-subset_taxa(ps_16S, Kingdom %in% c("Archaea", "Bacteria"))
+# remove chloroplasts
+ps_16S_s<-subset_samples(ps_16S_s, SampleType %in% c("Faecal", "Rumen", "P.RyeGrassLeaf",  "WhiteCloverLeaf", "BulkSoil", "P.RyeGrassRoot", "WhiteCloverRoot")) 
+
+# Summarize read counts of each sample
+sample_sum_df <- data.frame(sum = sample_sums(ps_16S_s))
+summary(sample_sum_df)
+# Plot the histogram of sample read counts
+ggplot(sample_sum_df, aes(x = sum)) + geom_histogram(color = "black", fill = "indianred", binwidth = 1000) + ggtitle("Distribution of sample sequencing depth") + xlab("Read counts") + theme(axis.title.y = element_blank(), axis.text.x = element_text(angle=90)) + scale_x_continuous(breaks = seq(0, 300000, by = 5000)) # Ticks from 0-30000, every 5000
+
+# To keep the majority of the samples, rarefaction threshold is set to 10,000 reads per sample
+# Rarefication
+ps_16S_rare<-rarefy_even_depth(ps_16S_s, 10000,rngseed = 20) # a seed is set to allow reproductivity
+
+# remove chloroplast sequences
+ps_16S_rare<-subset_taxa(ps_16S_rare, Order!="Chloroplast")
+
+# remove any taxa that has no reads in any samples
+ps_16S_rare_trim <- prune_taxa(taxa_sums(ps_16S_rare)>=1, ps_16S_rare) 
+ps_16S_rare_trim
+
+# tsd<-data.frame(sample_data(ps_16S_rare_trim)) # save metadata as a dataframe for visulisation convinience
+
+
+
+```
+
+
+```{r alpha diveristy analyses}
+### alpha diversity summary as boxplots
+alpha_div<-plot_richness(ps_16S_rare_trim, x="SampleType", measures=c("Observed","InvSimpson"), color="SampleType")+geom_boxplot()+scale_color_manual(values =colourList1, na.value = "black")
+alpha_div
+# plot taxonomy profile between ecosystems at Phylum level
+
+rank_names(ps_16S_rare_trim) # check the taxa rank names to make sure they are correct
+## [1] "Kingdom" "Phylum"  "Class"   "Order"   "Family"  "Genus" 
+
+# A dataframe is made to remove rare taxa and see the big picture
+OLW_16S_Phylum_sum_asv<-ps_16S_rare_trim %>% 
+  tax_glom(taxrank = "Phylum") %>% 
+  transform_sample_counts(function(x) {x/sum(x)}) %>%
+  psmelt() %>% 
+  filter(Abundance>0.01) %>% 
+  arrange(Phylum)
+
+# remove unassinged samples from dataset
+OLW_16S_Phylum_sum_asv<-OLW_16S_Phylum_sum_asv[!is.na(OLW_16S_Phylum_sum_asv$SampleType),]
+
+# Create ecosystem types
+OLW_16S_Phylum_sum_asv$Ecosystem_type<-ifelse(OLW_16S_Phylum_sum_asv$SampleType=="BulkSoil","Soil", ifelse(OLW_16S_Phylum_sum_asv$SampleType%in%c("Faecal","Rumen"), "Animal","Plants"))
+OLW_16S_Phylum_sum_asv$SampleType<-factor(OLW_16S_Phylum_sum_asv$SampleType, levels = c("Faecal", "Rumen", "P.RyeGrassLeaf",  "WhiteCloverLeaf", "BulkSoil", "P.RyeGrassRoot", "WhiteCloverRoot"))
+
+# Stacked bar plot to show taxonomy composition summary for each sample type and facet by Nitrogen treatment levels
+
+P1<-OLW_16S_Phylum_sum_asv%>% 
+  mutate(Phylum = forcats::fct_reorder(Phylum, as.numeric(Abundance),.desc = TRUE)) %>%
+  dplyr::group_by(Phylum,SampleType,TreatmentType,Ecosystem_type) %>% 
+  summarize(Abundance=sum(Abundance)) %>% 
+  ggplot(aes(TreatmentType, Abundance, fill=Phylum))+geom_bar(stat = "identity", position = "fill") +scale_y_continuous(labels = percent_format()) +ylab("Relative Abundance")+theme(axis.title.y =element_text(size = 10),axis.title.x = element_blank(), axis.text.x = element_text(angle = 90), axis.text = element_text(size = 8,hjust = 1), legend.text = element_text(size = 8,hjust = 1), legend.title = element_text(size = 10),strip.text = element_text(size = 8),legend.key.size = unit(0.5, "cm"))+scale_fill_manual(values =colourList, guide = guide_legend(ncol = 1))+facet_wrap(Ecosystem_type~SampleType,ncol = 2)
+P1
+
+
+# subset the phyloseq object. Remove any sample with unrelated Treatment Types
+ps_test_N_treatment<-subset_samples(ps_16S_rare_trim, sample_data(ps_16S_rare_trim)$TreatmentType%in%c("RG 0N", "RG 150N", "RG 300N"))
+ps_test_N_treatment<-prune_taxa(taxa_sums(ps_test_N_treatment)>=1, ps_test_N_treatment)
+samdf_new<-data.frame(sample_data(ps_test_N_treatment))
+samdf_new$Ecosystem_type<-ifelse(samdf_new$SampleType=="BulkSoil","Soil", ifelse(samdf_new$SampleType%in%c("Faecal","Rumen"), "Animal","Plants"))
+samdf_new$Ecosystem_type<-ifelse(samdf_new$SampleType=="BulkSoil","Soil", ifelse(samdf_new$SampleType%in%c("Faecal","Rumen"), "Animal","Plants"))
+samdf_new$SampleType<-factor(samdf_new$SampleType, levels = c("Faecal", "Rumen", "P.RyeGrassLeaf",  "WhiteCloverLeaf", "BulkSoil", "P.RyeGrassRoot", "WhiteCloverRoot", "Effluent"))
+sample_data(ps_test_N_treatment)<-samdf_new
+
+
+# Violin plots and boxplot to show the alpha diversity (number of observed ASVs) in each sample type facet by Nitrogen treatment levels
+# add the kruskal-wallis test significance in the figure
+
+ASV_alpha<-plot_richness(ps_test_N_treatment, x="TreatmentType", measures=c("Observed"),shape = "TreatmentType")+facet_wrap(Ecosystem_type~SampleType, ncol =2)+theme(axis.title.y =element_text(size = 10), axis.title.x = element_blank(), axis.text.x = element_text(angle = 90,hjust = 1,vjust = 1), axis.text = element_text(size = 8,hjust = 1), legend.text = element_text(size = 8,hjust = 1), legend.title = element_text(size = 10),strip.text = element_text(size = 8))+geom_violin(outlier.size = -1)+ geom_boxplot(width=0.1,outlier.size = -1)+geom_jitter()+stat_compare_means(aes(label = ..p.signif..), label.x = 2, method = "kruskal.test")+scale_shape_manual(values=c(1, 3, 17))
+ASV_alpha
+
+# summarizethe alpha diversity in a table
+a_rich_OLW<-data.frame(estimate_richness(ps_test_N_treatment),samdf_new)
+
+# make sure the sample orders are right after combination between richness and metadata
+setdiff(rownames(a_rich_OLW), paste0("X",a_rich_OLW$Sample_uni))
+setdiff( paste0("X",a_rich_OLW$Sample_uni),rownames(a_rich_OLW))
+
+# stats
+kruskal.test(a_rich_OLW$Observed,a_rich_OLW$SampleType)
+
+
+
+# Compare alpha-diveristy between each pair
+pairwise.wilcox.test(a_rich_OLW$Observed,a_rich_OLW$SampleType,
+                 p.adjust.method = "BH")
+
+
+
+
+# Supp Table S2
+richness_sum<-a_rich_OLW %>% 
+  dplyr::group_by(a_rich_OLW$SampleType, a_rich_OLW$TreatmentType) %>% 
+  summarize(mean = mean(Observed),
+            median = median(Observed),
+            sd = sd(Observed),
+            max = max(Observed),
+            min = min(Observed),
+            n = length(Observed))
+
+
+# ASV_alpha_legend<-get_legend(ASV_alpha)
+
+# Supp Fig. S1
+
+# Evenness InvertSimpson
+# ASV_alpha_invsim<-plot_richness(ps_test_N_treatment, x="TreatmentType", measures=c("InvSimpson"), color="TreatmentType")+facet_wrap(Ecosystem_type~SampleType, ncol =2)+ggtitle("InvSimpson Measures")+theme(axis.title =element_text(size = 14), axis.text.x = element_text(angle = 90,hjust = 1,vjust = 1), axis.text = element_text(size = 14,hjust = 1), legend.text = element_text(size = 12,hjust = 1), legend.title = element_text(size = 14),strip.text = element_text(size = 12))+ geom_boxplot()+geom_jitter()+stat_compare_means(aes(label = ..p.signif..), label.x = 2, method = "kruskal.test")
+# ASV_alpha_invsim
+
+
+# Trend of alpha diveristy (number of observed ASVs)
+# ASV_alpha_smooth<-plot_richness(ps_test_N_treatment, x="TreatmentType", measures=c("Observed"), color="TreatmentType")+facet_wrap(Ecosystem_type~SampleType, ncol=2)+theme(axis.title =element_text(size = 14), axis.text.x = element_text(angle = 90,hjust = 1,vjust = 1), axis.text = element_text(size = 14,hjust = 1), legend.text = element_text(size = 12,hjust = 1), legend.title = element_text(size = 14),strip.text = element_text(size = 12))+ geom_boxplot(width=0.00001)+geom_smooth(aes(group=SampleType), method = "loess")+geom_jitter()+stat_compare_means(aes(label = ..p.signif..), label.x = 2, method = "kruskal.test")
+
+# ASV_alpha_smooth_r<-reposition_legend(ASV_alpha_smooth, 'bottom', panel='panel-2-4')
+
+# combine the voilin plot and stacked bar plot
+Fig1a<-ggarrange(ASV_alpha+theme(legend.position = "none"),P1, widths = c(2,3.2),  nrow = 1,labels = c("A","B"))
+Fig1a
+
+# Complete Fig.1 in the beta diversity analyses section
+
+# Supp Table S3
+phylum_RA<-ddply(OLW_16S_Phylum_sum_asv,.variables = c("Phylum","SampleType","TreatmentType","Ecosystem_type"),summarize,sum_Abundance = sum(Abundance))
+phylum_RA2<-ddply(phylum_RA,.variables = c("SampleType","TreatmentType","Ecosystem_type"),summarize,niche_sum_Abundance = sum(sum_Abundance))
+
+# Make supplementatl table S3
+RA_table<-merge(phylum_RA,phylum_RA2, by=c("SampleType","TreatmentType"))
+RA_table$Relative_abunance<-RA_table$sum_Abundance/RA_table$niche_sum_Abundance
+RA_table$Relative_abunance<-RA_table$sum_Abundance/RA_table$niche_sum_Abundance*100
+
+# Export table to a file
+write.table(RA_table, "/directory/to/Table_S3.txt", sep="\t",quote = FALSE) # CHANGE THE PATH
+
+```
+
+
+
+```{r beta diversity analyses}
+# Transform abundance data in the otu_table, sample-by-sample 
+ps_16S_rare.prop <- transform_sample_counts(ps_test_N_treatment, function(otu) otu/sum(otu)) # 
+
+# Calculate bray-curtis matrix based NMDS ordinations
+ord.nmds.bray <- ordinate(ps_16S_rare.prop, method="NMDS", distance="bray") # bray-curtis distance matrix
+ord.nmds.bray
+# stress: 0.103598 
+# NMDS plot group by Sample types and shape by nitrogen levels
+ASV_brayNMDS_p<-plot_ordination(ps_16S_rare.prop, ord.nmds.bray, color="SampleType", shape="TreatmentType") +stat_ellipse(aes(group=SampleType, color=SampleType), alpha=0,type='t',size =0.5, geom="polygon")+ geom_point(size = 2)+guides(colour = guide_legend(keyheight = 0.8,keywidth = 0.8))+scale_shape_manual(values=c(1, 3, 17))
+
+# change the legend titles to match manuscripts 
+ASV_brayNMDS_p$labels$shape <-"Nitrogen Treatment"
+ASV_brayNMDS_p$labels$colour <-"Niche Type"
+
+# ASV_brayNMDS_p+scale_color_manual(values =colourList1)
+
+# Fig.1 
+Fig1<-ggarrange(Fig1a, ASV_brayNMDS_p+scale_color_manual(values =colourList1)+theme(axis.title =element_text(size = 8), axis.text.x = element_text(angle = 90,hjust = 1,vjust = 1), axis.text = element_text(size = 8,hjust = 1), legend.text = element_text(size = 8,hjust = 1), legend.title = element_text(size = 10)), heights =c(14,7), widths = c(5,4),  nrow=2, labels = c("","C"))
+Fig1
+
+# save figure 1
+ggsave("/directory/to/Fig1_16S.pdf",Fig1, height =19, width = 17, units = "cm",dpi = 300) # CHANGE THE PATH
+
+
+# NMDS plots based on three major kind of ecosystems, soil, plant and animal associated
+ASV_brayNMDS_e<-plot_ordination(ps_16S_rare.prop, ord.nmds.bray, color="Ecosystem_type", shape="TreatmentType", title="ASV Bray NMDS between Ecosystem types") +stat_ellipse(aes(group=Ecosystem_type, color=Ecosystem_type), alpha=0,type='t',size =0.5, geom="polygon")
+ASV_brayNMDS_e+scale_color_manual(values =c("purple","dark green", "brown"))
+
+
+# Define treatment group and compare the bray-curtis differences between treatment groups
+TreatmentType = get_variable(ps_test_N_treatment, "TreatmentType")
+bray_16S<-phyloseq::distance(ps_test_N_treatment, method = "bray")
+# ANOSIM test on nitrogen levels
+ano_16S_treatment<-anosim(bray_16S,TreatmentType)
+ano_16S_treatment
+
+# Define treatment group and compare the bray-curtis differences between treatment groups
+Ecosystem_type = get_variable(ps_test_N_treatment, "Ecosystem_type")
+bray_16S<-phyloseq::distance(ps_test_N_treatment, method = "bray")
+# ANOSIM test on nitrogen levels
+ano_16S_Ecosystem_type<-anosim(bray_16S,Ecosystem_type)
+ano_16S_Ecosystem_type
+
+df = as(sample_data(ps_test_N_treatment), "data.frame")
+# ADONIS test on nitrogen levels
+ado_sig_N = adonis(bray_16S~df$TreatmentType, df)
+ado_sig_N
+# There is no statistical signigicant differences in microbiomes between different nitrogen treatment levels
+
+# Sample type dissmilarity tests
+SampleType = get_variable(ps_test_N_treatment, "SampleType")
+bray_16S<-phyloseq::distance(ps_test_N_treatment, method = "bray")
+
+# ANOSIM test on sample types
+ano_16S_sampletype<-anosim(bray_16S,SampleType)
+ano_16S_sampletype
+
+
+# ADONIS test on sample types
+ado_sig_S = adonis(bray_16S~df$SampleType, df)
+ado_sig_S
+
+
+# split the phyloseq based on sample types and loop each through to determine if anpy particular mirobiome is significantly affected by Urea treatment
+ps_rare_varsplit<-phyloseq_sep_variable(physeq = ps_test_N_treatment,variable = "SampleType")
+
+ano_df<-NULL # create an empty dataframe for store stats results
+ado_df<-NULL
+
+for (i in 1:length(ps_rare_varsplit)) {
+  if ((length(unique(sample_data(ps_rare_varsplit[[i]])$TreatmentType)) <=1)){
+next
+} 
+  TreatmentType = get_variable(ps_rare_varsplit[[i]], "TreatmentType")
+  TreatmentType = ifelse(is.na(TreatmentType), "Not_applicable",TreatmentType) # NA will break the anosim test, use "NA" as characters to avoid
+  bray_16S<-phyloseq::distance(ps_rare_varsplit[[i]], method = "bray") # calculate bray-curtis distance matrix
+  df = as(sample_data(ps_rare_varsplit[[i]]), "data.frame") # extract sample_data from each group
+  # Anosim test
+  ano_16S_temp<-anosim(bray_16S,TreatmentType)
+  SampleType<-names(ps_rare_varsplit[i])
+  ano_df_temp<-data.frame(ano_16S_temp$signif, ano_16S_temp$statistic,SampleType)
+  ano_df<-rbind(ano_df, ano_df_temp)
+  
+  #Perform ADONIS test
+  df$TreatmentType=ifelse(is.na(df$TreatmentType), "Not_applicable",TreatmentType) # NA will stop adonis, therefore changed to character
+  ado_sig = adonis(bray_16S~df$TreatmentType, df)
+  ado_df_temp<-data.frame(ado_sig$aov.tab$`Pr(>F)`[1],ado_sig$aov.tab$R2[1],rownames(ado_sig$aov.tab)[1],SampleType)
+  ado_df<-rbind(ado_df,ado_df_temp)
+}
+
+# Table2
+colnames(ano_df)<-c("ano_signif","statistic","SampleType") 
+# ANOSIM results summary
+View(ano_df)
+
+colnames(ado_df)<-c("ado_signif","R sqaure", "VariableName", "SampleType")
+# ADONIS results summary
+View(ado_df)
+
+
+```
+
+```{r find the taxa that have significant change after treatment within group}
+library(reshape2);packageVersion("reshape2")
+library(ggrepel);packageVersion("ggrepel")
+
+# Use the splited phyloseq by sample types
+ps_rare_varsplit<-phyloseq_sep_variable(physeq = ps_test_N_treatment,variable = "SampleType")
+taxa_sigtab<-NULL
+
+# for each sampletype, do exact test
+for (i in 1:length(ps_rare_varsplit)) {
+  if ((length(unique(sample_data(ps_rare_varsplit[[i]])$TreatmentType)) <=1)){
+next
+  } 
+  ps<-ps_rare_varsplit[[i]]
+  
+  # split the ps to two sub ps, one only contains [0N, 150N], the other contains [0N, 300N]
+  ps1<-subset_samples(ps, TreatmentType%in%c("RG 0N","RG 150N"))
+  ps_df1<-data.frame(sample_data(ps1))
+  ps_df1<-ps_df1[order(ps_df1$TreatmentType),]
+  sample_data(ps1)<-ps_df1
+  
+  ps2<-subset_samples(ps, TreatmentType%in%c("RG 0N","RG 300N"))
+  ps_df2<-data.frame(sample_data(ps2))
+  ps_df2<-ps_df2[order(ps_df2$TreatmentType),]
+  sample_data(ps2)<-ps_df2
+  edg1 = phyloseq_to_edgeR(ps1, group = sample_data(ps1)$TreatmentType)
+  edg2 = phyloseq_to_edgeR(ps2, group = sample_data(ps2)$TreatmentType)
+  et1= exactTest(edg1)
+  et2= exactTest(edg2)
+  tt1 = topTags(et1, n = nrow(et1$table), adjust.method = "BH", sort.by = "PValue") # FDR pvalues
+  tt2 = topTags(et2, n = nrow(et2$table), adjust.method = "BH", sort.by = "PValue") 
+  res1 = data.frame(tt1@.Data[[1]],Treatment_comparison="0_vs_150NG") # make into data frame
+  res2 = data.frame(tt2@.Data[[1]],Treatment_comparison="0_vs_300NG")
+  sigtab1 = res1[(res1$FDR<= 0.05),]
+  sigtab1$ASV<-rownames(sigtab1)
+  rownames(sigtab1)=NULL
+  sigtab2 = res2[(res2$FDR<= 0.05),]
+  sigtab2$ASV<-rownames(sigtab2)
+  rownames(sigtab2)=NULL
+  sigtab = rbind(sigtab1,sigtab2)
+  
+  if (nrow(sigtab) > 0){
+      sigtab_2fold <- subset(sigtab, (FDR<=0.05 & logFC >=2 | logFC <=-2 & FDR <=0.05))
+      sigtab_2fold$SampleType<-names(ps_rare_varsplit[i])
+      taxa_sigtab<-rbind(taxa_sigtab,sigtab_2fold)
+  }
+  sigtab<-NULL
+}
+
+
+# Fig. 3
+# dot plot for all taxa have > 2 fold change
+taxa_sigtab1<-taxa_sigtab %>% arrange(Phylum,Family, Genus) 
+taxa_sigtab1$ASV<-as.character(taxa_sigtab1$ASV) 
+taxa_sigtab1$x_label<-ifelse(is.na(taxa_sigtab1$Genus),paste0("Unclassified_",taxa_sigtab1$Family),as.character(taxa_sigtab1$Genus))
+color_level<-unique(taxa_sigtab1[,c("Phylum","ASV")])
+color_level$colour<-colourList[as.character(color_level$Phylum)]
+Fig3<-taxa_sigtab1 %>% mutate(ASV=factor(ASV, levels=unique(ASV))) %>% ggplot(aes(SampleType,ASV,color=Phylum))+geom_point(aes(size=abs(logFC)))+scale_color_manual(values =colourList)+ylab("Genus")+xlab("Niche Type")+theme(axis.title =element_text(size = 10), axis.text.x = element_text(size = 8),axis.text.y = element_text(size = 8, colour = color_level$colour, face="bold"),legend.text = element_text(size = 8,hjust = 1), legend.title = element_text(size = 10))+guides(colour = guide_legend(keyheight = 0.8,keywidth = 0.8))+scale_y_discrete(labels = as.character(unique(taxa_sigtab1[,c("x_label","Genus","ASV")])[,1]))
+# change the legend titles to match manuscripts 
+Fig3$labels$size<-"Absolute Log Fold Change"
+
+Fig3
+
+# Export Figure 3
+ggsave("/directory/to/Fig3_16S.pdf",Fig3, height =20, width = 17, units = "cm",dpi = 300) # CHANGE THE PATH
+
+
+
+
+# Export Table S4
+write.table(taxa_sigtab1, file = "/directory/to/Table_S4.txt", sep = "\t", quote = FALSE, row.names = F) # CHANGE THE PATH
+
+# shared across niches
+shared_ASV<-intersect(taxa_sigtab1$ASV[taxa_sigtab1$SampleType=="Faecal"],taxa_sigtab1$ASV[taxa_sigtab1$SampleType=="Rumen"])
+#[1] "ASV261" "ASV166" "ASV320"
+tm<-taxa_sigtab1[taxa_sigtab1$ASV%in%shared_ASV,]
+
+# vocano plot
+# Supp Fig.S7
+
+fig_s7<-ggplot(taxa_sigtab1) +
+        geom_jitter(aes(x=logFC, y=-log10(FDR), colour=Phylum))+
+        xlab("Log Fold Change") + 
+        ylab("-log10 adjusted p-value")+scale_x_continuous(breaks=seq(-6, 6, 2))+
+  facet_wrap(SampleType~Treatment_comparison)+scale_color_manual(values =colourList)+theme(axis.title =element_text(size = 10), axis.text = element_text(size = 8),legend.text = element_text(size = 8,hjust = 1), legend.title = element_text(size = 10))+guides(colour = guide_legend(keyheight = 0.8,keywidth = 0.8))
+
+
+# export Fig_S7
+ggsave("/directory/to/FigS7_16S.pdf", fig_s7, height =15, width = 17, units = "cm",dpi = 300) # CHANGE THE PATH
+
+
+
+# ASV abundance heatmap
+HeatM_exact<-subset_taxa(ps_test_N_treatment, rownames(tax_table(ps_test_N_treatment))%in%unique((taxa_sigtab1$ASV)))
+
+sample_data(HeatM_exact)$SampleType<- factor(sample_data(HeatM_exact)$SampleType, levels =c("P.RyeGrassRoot","Faecal","P.RyeGrassLeaf", "WhiteCloverRoot", "Rumen", "WhiteCloverLeaf", "BulkSoil"))
+OLW_hm<-plot_heatmap(HeatM_exact,sample.label = "TreatmentType", sample.order = "TreatmentType")+facet_wrap(~SampleType, drop = T, scales = "free_x")+ylab("Genus")+xlab("Nitrogen Treatment")+scale_y_discrete(labels = as.character(unique(taxa_sigtab1[,c("x_label","Genus","ASV")])[,1]))
+heatmap<-reposition_legend(OLW_hm, 'center', panel='panel-3-3')
+
+
+# Fig. S10
+temp_otu<-otu_table(HeatM_exact)
+temp_otu[temp_otu>0]=1
+otu_table(HeatM_exact)<-temp_otu
+sample_data(HeatM_exact)$SampleType<- factor(sample_data(HeatM_exact)$SampleType, levels =c("P.RyeGrassRoot","Faecal","P.RyeGrassLeaf", "WhiteCloverRoot", "Rumen", "WhiteCloverLeaf", "BulkSoil"))
+OLW_hm<-plot_heatmap(HeatM_exact,sample.label = "TreatmentType", sample.order = "TreatmentType")+facet_wrap(~SampleType,drop = T, scales = "free_x")+ylab("ASV")+scale_fill_gradientn(colours=c("#132B43","#56B1F7"), na.value = "transparent",breaks=c(0,1),labels=c("0","1"),limits=c(0,1))+scale_y_discrete(labels = as.character(unique(taxa_sigtab1[,c("x_label","Genus","ASV")])[,1]))
+OLW_hm$labels$fill<-"Presence"
+
+
+# export figure S10
+ggsave("/directory/to/FigS10_16S.tiff",OLW_hm, height =38, width = 34, units = "cm",dpi = 300) # CHANGE THE PATH
+# the tiff file is then resized to 19*17cm and save as pdf.
+# X lab changed to "Nitrogen Treatment" using Inkscape
+
+
+```
+
+```{r occupancy and frequency plots Figure 2}
+source("/directory/to/_csh_script.R")
+ps_rare_varsplit<-phyloseq_sep_variable(physeq = ps_test_N_treatment,variable = "SampleType")
+taxa_t<-data.frame(tax_table(ps_test_N_treatment))
+fre_occ_res<-NULL
+dts<-NULL
+for (i in 1:length(ps_rare_varsplit)) {
+ #   if ((length(unique(sample_data(ps_rare_varsplit[[i]])$TreatmentType)) <=1)){
+ # next} 
+  tryCatch({
+    
+     taxa_tab<-data.frame(otu_table(ps_rare_varsplit[[i]])) # extract otu table
+     N <- names(ps_rare_varsplit[i])
+     temp_dt<-taxa_tab
+     temp_dt[temp_dt>0]<-1 # convert to present and absent
+     temp_dt<-temp_dt[which(apply(temp_dt, 2, sum) >0)] # remove any ASV that does not exit in any sample
+     temp_dt_sum<-data.frame(taxa_t[which(rownames(taxa_t)%in%colnames(temp_dt[which(colSums(temp_dt)==max(colSums(temp_dt)))])),],t(taxa_tab[colnames(temp_dt[which(colSums(temp_dt)==max(colSums(temp_dt)))])]))
+     dts[[N]]<-temp_dt_sum
+     
+     
+     print(N)
+     temp<-csh(taxa_tab, name = N)
+     fre_occ_res[[N]]<-temp
+  }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+}
+ 
+
+fre_plots<-ggarrange(plotlist=fre_occ_res[c("P.RyeGrassRoot","Faecal","P.RyeGrassLeaf", "WhiteCloverRoot", "Rumen", "WhiteCloverLeaf", "BulkSoil")])
+fre_plots
+
+# Export Figure 2
+ggsave("/directory/to/Fig2.pdf",fre_plots, height =30, width = 34, units = "cm",dpi = 300) # CHANGE THE PATH
+# the pdf file is then resized to 15*17.
+
+```
+
+
+
+
+```{r Network remake Figure 4}
+library(stringr)
+library(tidyr)
+library(networkD3)
+library(igraph)
+library(psych)
+
+# Convert datasets into one file for making network plots
+Network_dataset<-cbind(as(sample_data(ps_test_N_treatment), "data.frame"),as(otu_table(ps_test_N_treatment)[rownames(data.frame(sample_data(ps_test_N_treatment)))], "matrix" ))
+
+top_200_ASV<-sort(taxa_sums(ps_test_N_treatment),decreasing = TRUE)[1:200]
+group_df<-split(Network_dataset, list(Network_dataset$SampleType, Network_dataset$TreatmentType))
+group_treatment_pair<-str_split_fixed(data.frame(as.character(names(group_df)))[,1], "\\.RG " ,2)
+group_treatment_pair<-data.frame(cbind(group_treatment_pair,as.character(names(group_df))))
+colnames(group_treatment_pair)<-c("SampleType","TreatmentType", "List_name")
+
+ASV_names<-union(names(top_200_ASV),taxa_sigtab1$ASV)
+chosen_asv<-cbind(Network_dataset[,1:10],Network_dataset[which(colnames(Network_dataset) %in% union(names(top_200_ASV),taxa_sigtab1$ASV))])
+# Supp Table S5
+# Export TableS5
+write.table(chosen_asv,"/directory/to/Table_S5.txt", quote = F, sep = '\t', row.names = F) # CHANGE THE PATH
+
+
+cor_res_total<-NULL
+for (l in 1:length(group_df)) {# for each subset dataset
+
+  df <-group_df[[l]]
+  Sub_Data <- df[,11:ncol(df)]
+  Sub_Data_filt<-data.frame(Sub_Data[which(colnames(Sub_Data)%in%union(names(top_200_ASV),taxa_sigtab1$ASV))])
+  Sub_Data_temp<-data.frame(Sub_Data_filt)
+  Sub_Data_temp[Sub_Data_temp>0]<-1
+  if (nrow(Sub_Data_filt)<3){
+  next
+  }
+  #calculate the correlations between top 200 abundant ASV plus anything that has significant fold change
+  #Only ASVs that are present in at least 60% of samples will be included
+  test_cor<-corr.test(Sub_Data_filt[which(apply(Sub_Data_temp, 2, sum)>=0.60*nrow(Sub_Data_temp))], method = "spearman", adjust = "BH", alpha = 0.05) 
+  # use the significant taxa as x and calcualte correlations from sig taxa to all taxa in the sub datasets
+  cor_res_keep<-test_cor$ci[which(test_cor$ci$p<0.05 & (!is.na(test_cor$ci$lower)|!is.na(test_cor$ci$upper))),]
+  if (nrow(cor_res_keep) == 0){
+    next}else{
+  cor_res_keep$Group<-group_treatment_pair$SampleType[match(names(group_df)[l],group_treatment_pair$List_name)]
+  cor_res_keep$TreatmentType<-paste0("RG ", group_treatment_pair$TreatmentType[match(names(group_df)[l],group_treatment_pair$List_name)])
+  rownames(cor_res_keep)<-paste0(rownames(cor_res_keep),"-0")
+  cor_res_total<-rbind(cor_res_total,cor_res_keep)
+    }
+}
+
+# format to fit MisNodes and MisLinks
+cor_res_total$ASV_pair<-rownames(cor_res_total)  
+cor_res_total<-separate(cor_res_total,"ASV_pair", into = c("ASV1","ASV2","NU"), sep = "-",remove = FALSE)
+cor_res_total$NU<-NULL
+cor_res_total$ASV_pair<-gsub("(ASV[0-9]+-ASV[0-9]+)-[0-9]+","\\1",cor_res_total$ASV_pair)
+cor_res_total$new_group<-paste0(cor_res_total$Group,"_",cor_res_total$TreatmentType)
+Samt<-sort(as.character(unique(cor_res_total$new_group)))
+
+# Supp table S6
+
+write.table(cor_res_total,"/directory/to/Table_S6.txt", quote = F, sep = '\t', row.names = F) # CHANGE THE PATH
+
+
+
+# Fig. 3 different layouts tested
+par(mfrow=c(1,1))
+
+layO<-layout_with_fr # The Fruchterman-Reingold layout algorithm
+
+# make all networks using a for loop
+for (st in Samt){
+  subgroup_OLW <- subset(cor_res_total, cor_res_total$new_group==st)
+  OLW_links<- data.frame(subgroup_OLW[c("ASV1","ASV2")],type="hyperlink", subgroup_OLW[c("r")]) %>% 
+    filter(abs(r) >= .8)
+  colnames(OLW_links)<-c("from","to","type", "weight")
+  OLW_nodes<-data.frame(id=union(OLW_links$from,OLW_links$to),Group=unique(subgroup_OLW$Group),TreatmentType=unique(subgroup_OLW$TreatmentType))
+  OLW_nodes$Phylum=tax_table(ps_test_N_treatment)[OLW_nodes$id,"Phylum"]
+  temp_net<-graph_from_data_frame(d=OLW_links, vertices=OLW_nodes, directed=F)
+  V(temp_net)$color=colourList[V(temp_net)$Phylum]
+  E(temp_net)$width <- abs(E(temp_net)$weight)*3
+  E(temp_net)$color=ifelse(E(temp_net)$weight>0, "#DCE319FF", "#440154FF") # yellow, darkpurple
+  graph_attr(temp_net, "layout") <- layO
+  V(temp_net)$label <- NA
+  print(st)
+  mbship<-as.numeric(as.factor(V(temp_net)$Phylum))
+  print(modularity(temp_net,mbship))
+  pdf(file = paste0("/directory/to/",st,".pdf"), width = 7, height = 3.5) # CHANGE THE PATHH
+  plot(temp_net, edge.color=E(temp_net)$color,vertex.label.color="black", main=paste0(st," Network"))
+  legend(x=-1.3, y=-0.1, unique(OLW_nodes$Phylum), pch=21, col="#777777", pt.bg=unique(colourList[V(temp_net)$Phylum]), pt.cex=1.5, cex=.8, bty="n", ncol=1)
+  dev.off()
+}
+
+
+# Note that to display figures in R after print all the pdfs, you have to run dev.off() multiple times until it returns NULL for the results. check dev.cur() for the current device, which should be RStudioGD. If it is showing anything other than RStudioGD, change it by using dev.set(which = 2)
+
+
+# Supp Table S7
+cor_res_total_summary<-cor_res_total %>% 
+  filter(abs(r) > .8) %>% 
+  dplyr::group_by(Group, TreatmentType) %>% 
+  summarize(No_of_nodes=length(union(unique(ASV1),unique(ASV2))),No_of_edge=length(r),Mean_no_edges_per_node=2*No_of_edge/No_of_nodes, sd_edge_per_node=sd(c(table(ASV1),table(ASV2))))
+
+# export supplemental table S7
+write.table(cor_res_total_summary,"/directory/to/Table_S7.txt", quote = F, sep = '\t', row.names = F) #CHANGE THE PATH
+
+
+
+# for each niche
+niche <-sort(as.character(unique(cor_res_total$Group)))
+for (ni in niche){
+  subgroup_OLW <- subset(cor_res_total, cor_res_total$Group==ni)
+  OLW_links<- data.frame(subgroup_OLW[c("ASV1","ASV2")],type="hyperlink", subgroup_OLW[c("r")]) %>% 
+    filter(abs(r) >= .8)
+  colnames(OLW_links)<-c("from","to","type", "weight")
+  OLW_nodes<-data.frame(id=union(OLW_links$from,OLW_links$to),Group=unique(subgroup_OLW$Group))
+  OLW_nodes$Phylum=tax_table(ps_test_N_treatment)[OLW_nodes$id,"Phylum"]
+  
+  temp_net<-graph_from_data_frame(d=OLW_links, vertices=OLW_nodes, directed=F)
+  V(temp_net)$color=colourList[V(temp_net)$Phylum]
+  E(temp_net)$width <- abs(E(temp_net)$weight)*3
+  E(temp_net)$color=ifelse(E(temp_net)$weight>0, "#DCE319FF", "#440154FF") # yellow, darkpurple
+  graph_attr(temp_net, "layout") <- layO
+  V(temp_net)$label <- NA
+  print(ni)
+  mbship<-as.numeric(as.factor(V(temp_net)$TreatmentType))
+  print(modularity(temp_net,mbship))
+  pdf(file = paste0("/directory/to/",ni,".pdf"), width = 7, height = 3.5) # CHANGE THE PATH
+  plot(temp_net, edge.color=E(temp_net)$color,vertex.label.color="black", main=paste0(ni," Network"))
+  legend(x=-1.3, y=-0.1, unique(OLW_nodes$Phylum), pch=21, col="#777777", pt.bg=unique(colourList[V(temp_net)$Phylum]), pt.cex=1.5, cex=.8, bty="n", ncol=1)
+  #dev.off()
+}
+
+```
+
+
+
+# list all packages used for this script and the version
+```{r}
+sessionInfo()
+
+```
